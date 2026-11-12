@@ -93,10 +93,10 @@ def test_csv_round_trip(tmp_path):
 
 def test_ai_timeout_configurable_and_validated(tmp_path):
     env = tmp_path / ".env"
-    env.write_text("AI_TIMEOUT_SECONDS=7\\n", encoding="utf-8")
+    env.write_text("AI_TIMEOUT_SECONDS=7\n", encoding="utf-8")
     assert Config.load(env).ai_timeout_seconds == 7
 
-    env.write_text("AI_TIMEOUT_SECONDS=0\\n", encoding="utf-8")
+    env.write_text("AI_TIMEOUT_SECONDS=0\n", encoding="utf-8")
     import pytest
     with pytest.raises(ValueError, match="AI_TIMEOUT_SECONDS"):
         Config.load(env)
