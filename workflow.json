@@ -1,0 +1,90 @@
+{
+  "name": "YouTube AI Studio - scheduled run and status report",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "Run every 6 hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 200]
+    },
+    {
+      "parameters": {
+        "command": "cd /workspaces/youtube-agent-studio && .venv/bin/python run.py"
+      },
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "Run pipeline",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [480, 200],
+      "notes": "Review your .env settings before activating. Keep uploads disabled until you have tested the pipeline."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 21 * * *"
+            }
+          ]
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "Daily status at 21:30",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 440]
+    },
+    {
+      "parameters": {
+        "command": "cd /workspaces/youtube-agent-studio && .venv/bin/python run.py --status --json"
+      },
+      "id": "a1000000-0000-4000-8000-000000000004",
+      "name": "Read pipeline status",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [480, 440],
+      "notes": "This writes status to the n8n execution output. Add a notification node if you want to send it elsewhere."
+    }
+  ],
+  "connections": {
+    "Run every 6 hours": {
+      "main": [
+        [
+          {
+            "node": "Run pipeline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily status at 21:30": {
+      "main": [
+        [
+          {
+            "node": "Read pipeline status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false
+}
