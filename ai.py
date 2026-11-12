@@ -50,7 +50,7 @@ class AIClient:
             return min(limit, deadline - time.monotonic())
 
         try:
-            budget = remaining(5.0)
+            budget = remaining(2.0)
             if budget <= 0:
                 raise requests.Timeout("AI provider check timed out")
             r = self.session.get(
@@ -71,7 +71,7 @@ class AIClient:
 
         if self.cfg.openrouter_api_key and time.monotonic() < deadline:
             try:
-                budget = remaining(15.0)
+                budget = remaining(2.0)
                 if budget <= 0:
                     raise requests.Timeout("AI provider check timed out")
                 r = self.session.get(
