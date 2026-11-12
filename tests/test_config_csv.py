@@ -29,6 +29,7 @@ def test_config_defaults(tmp_path):
     assert cfg.shorts_slots == ["06:00", "11:00"]
     assert cfg.short_min == 30
     assert cfg.max_shorts_per_day == 5
+    assert cfg.ai_timeout_seconds == 20
 
 
 def test_config_load_does_not_leak_between_files(tmp_path):
@@ -87,3 +88,15 @@ def test_csv_round_trip(tmp_path):
     assert db.video("abc123def45")["rights_status"] == "owned"
 
     db.close()
+
+
+
+def test_ai_timeout_configurable_and_validated(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("AI_TIMEOUT_SECONDS=7\\n", encoding="utf-8")
+    assert Config.load(env).ai_timeout_seconds == 7
+
+    env.write_text("AI_TIMEOUT_SECONDS=0\\n", encoding="utf-8")
+    import pytest
+    with pytest.raises(ValueError, match="AI_TIMEOUT_SECONDS"):
+        Config.load(env)
