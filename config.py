@@ -68,6 +68,7 @@ class Config:
     openrouter_base_url: str
     openrouter_model: str
     ai_provider: str
+    ai_timeout_seconds: int
     loop_interval_minutes: int
 
     region_code: str
@@ -126,6 +127,7 @@ class Config:
             openrouter_model=_env("OPENROUTER_MODEL",
                                   "openrouter/free", values),
             ai_provider=_env("AI_PROVIDER", "ollama", values).lower(),
+            ai_timeout_seconds=_int("AI_TIMEOUT_SECONDS", 20, values),
             loop_interval_minutes=_int("LOOP_INTERVAL_MINUTES", 360, values),
 
             region_code=_env("REGION_CODE", "IN", values).upper(),
@@ -226,5 +228,7 @@ class Config:
             raise ValueError("Daily publishing limits must be at least 1")
         if self.max_retries < 1:
             raise ValueError("MAX_RETRIES must be at least 1")
+        if not 1 <= self.ai_timeout_seconds <= 120:
+            raise ValueError("AI_TIMEOUT_SECONDS must be between 1 and 120")
         if self.loop_interval_minutes < 1:
             raise ValueError("LOOP_INTERVAL_MINUTES must be at least 1")
