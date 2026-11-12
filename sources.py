@@ -194,12 +194,19 @@ class Discovery:
                 "(yes/no/unsure), directed_to_children (yes/no/unsure), "
                 "content_type, and reason."
             )
-            result = self.ai.chat_json(
-                "Classify video metadata cautiously. Do not assume a video is safe.",
-                prompt,
-                _classification_validator,
-                f"classify:{candidate['video_id']}",
-            )
+            try:
+                result = self.ai.chat_json(
+                    "Classify video metadata cautiously. Do not assume a video is safe.",
+                    prompt,
+                    _classification_validator,
+                    f"classify:{candidate['video_id']}",
+                )
+            except Exception as exc:
+                log.warning(
+                    "AI classification failed for %s; marking for review: %s",
+                    candidate["video_id"], str(exc)[:200],
+                )
+                result = None
             if result:
                 data, provider = result
                 return {

@@ -40,10 +40,21 @@ class AIClient:
         self.usable = {"ollama": False, "openrouter": False}
         self.detail = {}
 
-    def check(self) -> dict:
+    def check(self, timeout: float | None = None) -> dict:
+        """Check configured providers within a shared time budget."""
+        deadline = time.monotonic() + (
+            timeout if timeout is not None else self.cfg.ai_timeout_seconds
+        )
+
+        def remaining(limit: float) -> float:
+            return min(limit, deadline - time.monotonic())
+
         try:
+            budget = remaining(2.0)
+            if budget <= 0:
+                raise requests.Timeout("AI provider check timed out")
             r = self.session.get(
-                f"{self.cfg.ollama_base_url}/api/tags", timeout=5)
+                f"{self.cfg.ollama_base_url}/api/tags", timeout=budget)
             r.raise_for_status()
             names = {m.get("name", "") for m in r.json().get("models", [])}
             want = self.cfg.ollama_model
@@ -58,13 +69,16 @@ class AIClient:
             self.usable["ollama"] = False
             self.detail["ollama"] = f"not reachable: {exc}"
 
-        if self.cfg.openrouter_api_key:
+        if self.cfg.openrouter_api_key and time.monotonic() < deadline:
             try:
+                budget = remaining(2.0)
+                if budget <= 0:
+                    raise requests.Timeout("AI provider check timed out")
                 r = self.session.get(
                     f"{self.cfg.openrouter_base_url}/key",
                     headers={
                         "Authorization": f"Bearer {self.cfg.openrouter_api_key}"},
-                    timeout=15,
+                    timeout=budget,
                 )
                 r.raise_for_status()
                 self.usable["openrouter"] = True
@@ -74,7 +88,10 @@ class AIClient:
                 self.detail["openrouter"] = f"not available: {exc}"
         else:
             self.usable["openrouter"] = False
-            self.detail["openrouter"] = "no API key configured"
+            self.detail["openrouter"] = (
+                "no API key configured" if not self.cfg.openrouter_api_key
+                else "not checked: AI timeout budget exhausted"
+            )
 
         self.checked = True
         return {"ok": any(self.usable.values()), "providers": dict(self.usable), "detail": dict(self.detail)}
@@ -83,7 +100,8 @@ class AIClient:
     def available(self) -> bool:
         return any(self.usable.values())
 
-    def _call(self, provider: str, system: str, user: str) -> str:
+    def _call(self, provider: str, system: str, user: str, timeout: float | None = None) -> str:
+        request_timeout = timeout if timeout is not None else self.cfg.ai_timeout_seconds
         if provider == "ollama":
             r = self.session.post(
                 f"{self.cfg.ollama_base_url}/api/chat",
@@ -96,7 +114,7 @@ class AIClient:
                         {"role": "user", "content": user},
                     ],
                 },
-                timeout=30,
+                timeout=request_timeout,
             )
             r.raise_for_status()
             return r.json()["message"]["content"]
@@ -112,7 +130,7 @@ class AIClient:
                     {"role": "user", "content": user},
                 ],
             },
-            timeout=30,
+            timeout=request_timeout,
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
@@ -122,6 +140,7 @@ class AIClient:
         return [p for p in ([first] + [x for x in ("ollama", "openrouter") if x != first]) if self.usable.get(p)]
 
     def chat_json(self, system: str, user: str, validator: Callable[[dict], dict], namespace: str) -> tuple[dict, str] | None:
+        deadline = time.monotonic() + self.cfg.ai_timeout_seconds
         key = hashlib.sha256(
             f"{namespace}\\n{system}\\n{user}".encode()).hexdigest()
         if self.db:
@@ -133,13 +152,20 @@ class AIClient:
                     pass
 
         if not self.checked:
-            self.check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            self.check(timeout=remaining)
 
         for provider in self._order():
             prompt = user
             for attempt in range(1, self.cfg.max_retries + 1):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.warning("AI classification timed out before provider %s completed", provider)
+                    return None
                 try:
-                    raw = self._call(provider, system, prompt)
+                    raw = self._call(provider, system, prompt, timeout=remaining)
                     data = validator(extract_json(raw))
                 except Exception as exc:
                     msg = str(exc)[:200]
@@ -149,7 +175,9 @@ class AIClient:
                         f"\\n\\nPrevious answer rejected: {msg}. Return ONLY valid JSON."
                     if attempt >= self.cfg.max_retries:
                         break
-                    time.sleep(min(2 ** attempt, 20))
+                    pause = min(2 ** attempt, 20, max(0.0, deadline - time.monotonic()))
+                    if pause > 0:
+                        time.sleep(pause)
                     continue
 
                 if self.db:
