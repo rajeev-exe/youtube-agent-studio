@@ -106,7 +106,7 @@ class YouTubeAPI:
                 body: dict | None = None, oauth: bool = False) -> dict:
         params = params or {}
         url = f"{API_BASE}/{resource}"
-        for attempt in range(1, self.cfg.max_retries + 1):
+        for attempt in range(1, min(3, self.cfg.max_retries) + 1):
             try:
                 r = self.s.request(
                     method,
@@ -114,10 +114,10 @@ class YouTubeAPI:
                     params=params,
                     json=body,
                     headers=self.auth_headers(oauth),
-                    timeout=60,
+                    timeout=(5, 10),
                 )
             except requests.RequestException as exc:
-                if attempt >= self.cfg.max_retries:
+                if attempt >= min(3, self.cfg.max_retries):
                     raise ApiError(0, "network", str(exc)) from exc
                 time.sleep(min(2 ** attempt, 20))
                 continue
@@ -130,7 +130,7 @@ class YouTubeAPI:
                     pass
 
             if r.status_code in (429, 500, 502, 503, 504):
-                if attempt >= self.cfg.max_retries:
+                if attempt >= min(3, self.cfg.max_retries):
                     self.raise_for_error(r)
                 time.sleep(min(2 ** attempt, 30))
                 continue

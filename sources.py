@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 from datetime import datetime, timezone
 
 from ai import AIClient
@@ -142,9 +143,17 @@ class Discovery:
         self.api = api
         self.ai = ai
         self.now = now or datetime.now(timezone.utc)
+        self.errors: list[str] = []
+        self.malformed_count = 0
 
     def collect(self) -> dict[str, dict]:
-        """Collect videos from YouTube's popular chart and configured search terms."""
+        """Collect compact candidates, deduplicated by video ID.
+
+        Keep only fields used downstream instead of retaining each full API
+        response (including unused snippet/status payloads).
+        """
+        self.errors.clear()
+        self.malformed_count = 0
         items: dict[str, dict] = {}
 
         for category_id in ("24", "1", "27"):
@@ -152,11 +161,16 @@ class Discovery:
                 for item in self.api.most_popular(
                     self.cfg.region_code, category_id, self.cfg.discovery_limit
                 ):
-                    candidate = item_to_candidate(item)
-                    items[candidate["video_id"]] = item
+                    try:
+                        candidate = item_to_candidate(item)
+                    except (KeyError, TypeError, ValueError):
+                        self.malformed_count += 1
+                        continue
+                    items[candidate["video_id"]] = candidate
             except QuotaExceeded:
                 raise
             except ApiError as exc:
+                self.errors.append(f"Popular chart category {category_id}: {exc}")
                 log.warning("Popular chart category %s unavailable: %s", category_id, exc)
 
         for query in self.cfg.search_keywords:
@@ -168,23 +182,30 @@ class Discovery:
                     published_after=None,
                     max_results=25,
                 )
-                ids = [
+                ids = list(dict.fromkeys(
                     result.get("id", {}).get("videoId")
                     for result in results
                     if result.get("id", {}).get("videoId")
-                ]
+                    and result["id"]["videoId"] not in items
+                ))
                 if ids:
                     for item in self.api.videos_list(ids):
-                        items[item["id"]] = item
+                        try:
+                            candidate = item_to_candidate(item)
+                        except (KeyError, TypeError, ValueError):
+                            self.malformed_count += 1
+                            continue
+                        items[candidate["video_id"]] = candidate
             except QuotaExceeded:
                 log.warning("Search quota reached; keeping collected results")
                 break
             except ApiError as exc:
+                self.errors.append(f"Search {query!r}: {exc}")
                 log.warning("Search for %r failed: %s", query, exc)
 
         return items
 
-    def classify(self, candidate: dict) -> dict:
+    def classify(self, candidate: dict, timeout: float | None = None) -> dict:
         if self.ai is not None:
             prompt = (
                 f"Title: {candidate['title']}\n"
@@ -200,13 +221,14 @@ class Discovery:
                     prompt,
                     _classification_validator,
                     f"classify:{candidate['video_id']}",
+                    timeout=timeout,
                 )
             except Exception as exc:
                 log.warning(
                     "AI classification failed for %s; marking for review: %s",
-                    candidate["video_id"], str(exc)[:200],
+                    candidate["video_id"], type(exc).__name__,
                 )
-                result = None
+                return self._needs_review(type(exc).__name__)
             if result:
                 data, provider = result
                 return {
@@ -217,13 +239,10 @@ class Discovery:
                     "ai_status": f"ai:{provider}",
                 }
 
-        return {
-            "ai_relevance": 0.0,
-            "ai_family_suitable": "unsure",
-            "ai_content_type": "other",
-            "ai_directed_to_children": "unsure",
-            "ai_status": "needs_review",
-        }
+            reason = getattr(self.ai, "last_failure", None) or "AI response unavailable"
+            return self._needs_review(reason)
+
+        return self._needs_review("AI classifier not configured")
 
     @staticmethod
     def status_for(classification: dict) -> str:
@@ -235,18 +254,12 @@ class Discovery:
             return "discovered"
         return "needs_review"
 
-    def run(self) -> dict:
+    def run(self, *, dry_run: bool = False, classify: bool = True) -> dict:
         items = self.collect()
-        kept = []
-        dropped = 0
+        candidates = []
+        dropped = self.malformed_count
 
-        for item in items.values():
-            try:
-                candidate = item_to_candidate(item)
-            except (KeyError, TypeError, ValueError):
-                dropped += 1
-                continue
-
+        for candidate in items.values():
             if (
                 candidate["_privacy"] != "public"
                 or candidate["_live"] != "none"
@@ -265,21 +278,57 @@ class Discovery:
             candidate["score"] = score
             candidate["score_detail"] = json.dumps(detail)
             candidate["source"] = "youtube_discovery"
-
-            classification = self.classify(candidate)
-            candidate.update(classification)
-            candidate["status"] = self.status_for(classification)
             candidate.pop("_privacy", None)
             candidate.pop("_live", None)
-            kept.append(candidate)
+            candidates.append(candidate)
 
-        kept.sort(key=lambda video: video["score"], reverse=True)
-        kept = kept[: self.cfg.discovery_limit]
+        # AI is expensive: rank and cap before classification so candidates
+        # that cannot appear in results never trigger an inference request.
+        candidates.sort(key=lambda video: video["score"], reverse=True)
+        kept = candidates[: self.cfg.discovery_limit]
+        ai_deadline = time.monotonic() + self.cfg.ai_discovery_budget_seconds
+        ai_unavailable = False
+        for candidate in kept:
+            remaining = ai_deadline - time.monotonic()
+            if not classify:
+                classification = self._needs_review("AI classification disabled for this dry-run")
+            elif self.ai is None:
+                classification = self._needs_review("AI classifier not configured")
+            elif ai_unavailable:
+                classification = self._needs_review("AI unavailable after an earlier candidate failure")
+            elif remaining <= 0:
+                classification = self._needs_review("Discovery AI time budget expired")
+            else:
+                classification = self.classify(candidate, timeout=remaining)
+                if classification["ai_status"] == "needs_review":
+                    # A transport failure or invalid response is a strong
+                    # signal that more serial requests will only add latency.
+                    # Fail closed for the rest of this run.
+                    ai_unavailable = True
+            candidate.update(classification)
+            candidate["status"] = self.status_for(classification)
 
-        new_count = sum(1 for candidate in kept if self.db.upsert_candidate(candidate))
+        new_count = 0
+        if not dry_run:
+            if self.db is None:
+                raise ValueError("database is required unless dry_run=True")
+            new_count = sum(1 for candidate in kept if self.db.upsert_candidate(candidate))
         return {
             "collected": len(items),
             "dropped": dropped,
             "kept": len(kept),
             "new": new_count,
+            "results": [{k: c.get(k) for k in ("video_id", "title", "channel", "views", "score", "status", "ai_status", "ai_error")} for c in kept],
+            "errors": list(self.errors),
+        }
+
+    @staticmethod
+    def _needs_review(reason: str) -> dict:
+        return {
+            "ai_relevance": 0.0,
+            "ai_family_suitable": "unsure",
+            "ai_content_type": "other",
+            "ai_directed_to_children": "unsure",
+            "ai_status": "needs_review",
+            "ai_error": reason,
         }

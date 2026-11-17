@@ -10,6 +10,7 @@ output/
 trending.csv
 links.csv
 report.md
+logs/
 
 .env
 .env.*

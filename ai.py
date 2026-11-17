@@ -18,7 +18,7 @@ log = logging.getLogger("yta.ai")
 
 def extract_json(text: str) -> dict:
     t = text.strip()
-    t = re.sub(r"^```(?:json)?\\s*|\\s*```$", "", t, flags=re.S)
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.S | re.I)
     try:
         value = json.loads(t)
     except ValueError:
@@ -39,12 +39,11 @@ class AIClient:
         self.checked = False
         self.usable = {"ollama": False, "openrouter": False}
         self.detail = {}
+        self.last_failure: str | None = None
 
     def check(self, timeout: float | None = None) -> dict:
         """Check configured providers within a shared time budget."""
-        deadline = time.monotonic() + (
-            timeout if timeout is not None else self.cfg.ai_timeout_seconds
-        )
+        deadline = time.monotonic() + (10.0 if timeout is None else min(10.0, timeout))
 
         def remaining(limit: float) -> float:
             return min(limit, deadline - time.monotonic())
@@ -54,9 +53,16 @@ class AIClient:
             if budget <= 0:
                 raise requests.Timeout("AI provider check timed out")
             r = self.session.get(
-                f"{self.cfg.ollama_base_url}/api/tags", timeout=budget)
+                f"{self.cfg.ollama_base_url}/api/tags",
+                timeout=(min(3.0, budget / 2), max(0.05, budget - min(3.0, budget / 2))))
             r.raise_for_status()
-            names = {m.get("name", "") for m in r.json().get("models", [])}
+            payload = r.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get("models", []), list):
+                raise ValueError("malformed Ollama tags response")
+            names = {
+                m.get("name", "") for m in payload.get("models", [])
+                if isinstance(m, dict) and isinstance(m.get("name"), str)
+            }
             want = self.cfg.ollama_model
             ok = (
                 want in names
@@ -67,7 +73,7 @@ class AIClient:
             self.detail["ollama"] = f"reachable, model {want} ready" if ok else f"not ready: {want}"
         except Exception as exc:
             self.usable["ollama"] = False
-            self.detail["ollama"] = f"not reachable: {exc}"
+            self.detail["ollama"] = f"not reachable ({type(exc).__name__})"
 
         if self.cfg.openrouter_api_key and time.monotonic() < deadline:
             try:
@@ -85,7 +91,7 @@ class AIClient:
                 self.detail["openrouter"] = f"reachable, key accepted for {self.cfg.openrouter_model}"
             except requests.RequestException as exc:
                 self.usable["openrouter"] = False
-                self.detail["openrouter"] = f"not available: {exc}"
+                self.detail["openrouter"] = f"not available ({type(exc).__name__})"
         else:
             self.usable["openrouter"] = False
             self.detail["openrouter"] = (
@@ -101,7 +107,9 @@ class AIClient:
         return any(self.usable.values())
 
     def _call(self, provider: str, system: str, user: str, timeout: float | None = None) -> str:
-        request_timeout = timeout if timeout is not None else self.cfg.ai_timeout_seconds
+        request_timeout = timeout if timeout is not None else min(10.0, float(self.cfg.ai_timeout_seconds))
+        connect_timeout = min(3.0, request_timeout)
+        timeout_pair = (connect_timeout, request_timeout)
         if provider == "ollama":
             r = self.session.post(
                 f"{self.cfg.ollama_base_url}/api/chat",
@@ -109,12 +117,13 @@ class AIClient:
                     "model": self.cfg.ollama_model,
                     "stream": False,
                     "format": "json",
+                    "options": {"num_predict": 128},
                     "messages": [
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
                     ],
                 },
-                timeout=request_timeout,
+                timeout=timeout_pair,
             )
             r.raise_for_status()
             return r.json()["message"]["content"]
@@ -130,7 +139,7 @@ class AIClient:
                     {"role": "user", "content": user},
                 ],
             },
-            timeout=request_timeout,
+            timeout=timeout_pair,
         )
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"]
@@ -139,8 +148,27 @@ class AIClient:
         first = self.cfg.ai_provider
         return [p for p in ([first] + [x for x in ("ollama", "openrouter") if x != first]) if self.usable.get(p)]
 
-    def chat_json(self, system: str, user: str, validator: Callable[[dict], dict], namespace: str) -> tuple[dict, str] | None:
-        deadline = time.monotonic() + self.cfg.ai_timeout_seconds
+    def chat_json(
+        self,
+        system: str,
+        user: str,
+        validator: Callable[[dict], dict],
+        namespace: str,
+        timeout: float | None = None,
+    ) -> tuple[dict, str] | None:
+        """Return validated cached/provider JSON within a bounded time budget.
+
+        Socket timeouts bound connect and idle-read waits. Transport failures
+        are terminal for this request; retrying them tends to amplify a slow or
+        unavailable local model. One correction attempt is reserved for a
+        response that arrived but failed JSON/schema validation.
+        """
+        self.last_failure = None
+        budget = min(float(self.cfg.ai_timeout_seconds), timeout) if timeout is not None else float(self.cfg.ai_timeout_seconds)
+        if budget <= 0:
+            self.last_failure = "BudgetExhausted"
+            return None
+        deadline = time.monotonic() + budget
         key = hashlib.sha256(
             f"{namespace}\\n{system}\\n{user}".encode()).hexdigest()
         if self.db:
@@ -154,33 +182,58 @@ class AIClient:
         if not self.checked:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                self.last_failure = "BudgetExhausted"
                 return None
             self.check(timeout=remaining)
 
         for provider in self._order():
             prompt = user
-            for attempt in range(1, self.cfg.max_retries + 1):
+            # Retry only a malformed model answer, at most once. Network and
+            # timeout errors should not trigger another expensive generation.
+            for attempt in range(1, 3):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    self.last_failure = "BudgetExhausted"
                     log.warning("AI classification timed out before provider %s completed", provider)
                     return None
                 try:
                     raw = self._call(provider, system, prompt, timeout=remaining)
                     data = validator(extract_json(raw))
+                except requests.RequestException as exc:
+                    self.last_failure = type(exc).__name__
+                    log.warning(
+                        "AI (%s) request failed for %s: %s",
+                        provider,
+                        namespace,
+                        type(exc).__name__,
+                    )
+                    if isinstance(exc, (requests.Timeout, TimeoutError)):
+                        return None
+                    break
                 except Exception as exc:
-                    msg = str(exc)[:200]
+                    if isinstance(exc, TimeoutError):
+                        self.last_failure = type(exc).__name__
+                        log.warning(
+                            "AI (%s) request failed for %s: %s",
+                            provider,
+                            namespace,
+                            type(exc).__name__,
+                        )
+                        return None
+                    msg = type(exc).__name__
                     log.warning(
                         "AI (%s) invalid response attempt %d: %s", provider, attempt, msg)
                     prompt = user + \
                         f"\\n\\nPrevious answer rejected: {msg}. Return ONLY valid JSON."
-                    if attempt >= self.cfg.max_retries:
+                    if attempt == 2:
+                        self.last_failure = f"InvalidResponse:{msg}"
                         break
-                    pause = min(2 ** attempt, 20, max(0.0, deadline - time.monotonic()))
-                    if pause > 0:
-                        time.sleep(pause)
                     continue
 
                 if self.db:
                     self.db.cache_put(key, json.dumps(data), provider)
+                self.last_failure = None
                 return data, provider
+        if self.last_failure is None:
+            self.last_failure = "NoProviderAvailable"
         return None
