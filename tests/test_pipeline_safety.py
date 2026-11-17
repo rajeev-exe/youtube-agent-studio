@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 from pathlib import Path
 
+import pytest
+
+from downloader import Downloader, RightsError
 from pipeline import Pipeline
 from splitter import Splitter
 from storage import Database
@@ -20,10 +23,31 @@ def test_disabled_pipeline_stages_leave_queued_video_untouched(tmp_path):
     db.close()
 
 
+def test_downloader_requires_explicit_authorization_before_download(tmp_path):
+    cfg = make_cfg(tmp_path, fake=True)
+    db = Database(cfg.db_path)
+    video_id = "vidP0000002"
+    db.upsert_candidate({
+        "video_id": video_id,
+        "url": f"https://youtube.com/watch?v={video_id}",
+        "title": "Need permission first",
+        "channel": "owner",
+        "status": "queued",
+        "rights_status": "pending",
+        "source": "manual",
+    })
+
+    with pytest.raises(RightsError):
+        Downloader(cfg, db, runner=lambda cmd: (
+            0, "ok")).download(db.video(video_id))
+
+    db.close()
+
+
 def test_unimplemented_upload_never_records_fake_success(tmp_path):
     cfg = make_cfg(tmp_path, fake=True, AUTO_UPLOAD="true", DRY_RUN="false")
     db = Database(cfg.db_path)
-    video_id = "vidP0000002"
+    video_id = "vidP0000003"
     add_video(db, video_id)
     db.update_video(video_id, status="scheduled")
     clip_path = tmp_path / "clip.mp4"
@@ -45,7 +69,7 @@ def test_splitter_registers_original_as_long_clip(tmp_path, monkeypatch):
     cfg = make_cfg(tmp_path, fake=True, UPLOAD_LONG_VIDEO="true")
     cfg.short_min, cfg.short_max = 1, 15
     db = Database(cfg.db_path)
-    video_id = "vidP0000003"
+    video_id = "vidP0000004"
     video = add_video(db, video_id)
     work_dir = tmp_path / "video"
     work_dir.mkdir()
@@ -76,7 +100,8 @@ def test_splitter_registers_original_as_long_clip(tmp_path, monkeypatch):
     clips = Splitter(cfg, db).split(video)
 
     assert len(clips) == 3
-    assert any(clip["kind"] == "long" and clip["path"] == str(original) for clip in clips)
+    assert any(clip["kind"] == "long" and clip["path"]
+               == str(original) for clip in clips)
     assert sum(clip["kind"] == "short" for clip in clips) == 2
     assert all(clip["cut_status"] == "done" for clip in clips)
     db.close()

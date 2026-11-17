@@ -101,7 +101,8 @@ def test_reservation_is_atomic(cfg, db):
 
 def test_no_long_video_campaign(cfg, db):
     cl = campaign(db, sched(cfg, db), "vidH0000001", 3, long=False)
-    assert ("long", 0) not in cl and local(cl[("short", 1)]).strftime("%H:%M") == "06:00" or True
+    assert ("long", 0) not in cl
+    assert local(cl[("short", 1)]).strftime("%H:%M") in cfg.shorts_slots
     days = [local(cl[("short", p)]).date() for p in range(1, 4)]
     assert all((b - a).days == 1 for a, b in zip(days, days[1:]))
 

@@ -107,3 +107,83 @@ writes the line without it.
 ## Licence
 
 MIT. Use it, change it, ship it.
+
+## Safe application guide
+
+This repository is a local Python application for read-only YouTube discovery and a gated, manual workflow. The default project state is intentionally safe: discovery and diagnostics do not download, process, schedule, delete, or upload anything. Keep all automation flags off unless you explicitly want to test a local workflow and have confirmed you own or are authorized to use the media.
+
+### Default safety settings
+
+- `DRY_RUN=true`
+- `AUTO_DISCOVER=false`
+- `AUTO_DOWNLOAD=false`
+- `AUTO_SPLIT=false`
+- `AUTO_METADATA=false`
+- `AUTO_SCHEDULE=false`
+- `AUTO_UPLOAD=false`
+- `DELETE_AFTER_VERIFICATION=false`
+
+Do not set `AUTO_UPLOAD=true` or enable scheduling or publishing without explicit user approval and a real, verified upload implementation.
+
+### Configuration and entry points
+
+- `Config.load()` reads environment variables from `.env` in the repo root; see [config.py](config.py).
+- The CLI entry point is [run.py](run.py). It supports status checks, rights updates, and a safe loop mode.
+- The Streamlit UI is [app.py](app.py). It is read-only by default and forces `cfg.auto_upload = False` and `cfg.dry_run = True` before showing status.
+- Read-only health and discovery diagnostics are in [scripts/diagnostics.py](scripts/diagnostics.py).
+
+### Safe commands
+
+Start the dashboard in safe mode from the repo root:
+
+```bash
+.venv/bin/python -m streamlit run app.py --server.headless true --server.port 8501
+```
+
+Check project status:
+
+```bash
+.venv/bin/python run.py --status
+```
+
+Run a bounded read-only discovery check without AI classification:
+
+```bash
+timeout 45s .venv/bin/python scripts/diagnostics.py --discovery-only
+```
+
+Each completed dashboard discovery dry-run writes a timestamped Markdown review under `logs/` and offers the same report for download. The report lists candidate IDs and titles, AI status and sanitized failure reasons, source warnings, and confirms that the dry-run made no database or video-processing changes. A dry-run from before this report feature cannot be reconstructed per candidate if its result rows were not retained.
+
+Run the unit tests for mocked safety checks:
+
+```bash
+.venv/bin/python -m pytest -q
+```
+
+### Rights gate and AI safety
+
+- A video is only eligible for download or processing after its `rights_status` is explicitly set to an authorized value such as `owned`, `licensed`, or `permission_confirmed`.
+- Public availability in search results does not count as permission.
+- AI classification is bounded and fail-closed. If Ollama times out, is unavailable, or returns invalid data, the candidate is marked `needs_review` and no automatic approval is granted.
+- The project never auto-publishes or auto-schedules external actions.
+
+### Verified and unverified behavior
+
+Verified in the current repository:
+
+- read-only discovery runs safely
+- category 27 404 is logged as a warning and discovery continues
+- AI model listing can succeed while chat inference may still time out
+- upload remains intentionally disabled and must not be reported as successful
+
+Not verified for end-to-end use:
+
+- publishing to YouTube
+- real OAuth upload execution
+- automatic content processing without explicit, user-confirmed rights
+
+### Local media only
+
+Only process local media that you own or have explicit permission to use. Never treat a search result, a public listing, or a discovery score as authorization to redistribute, schedule, or publish content.
+
+This section is informational only; no external publishing action is enabled by default.
